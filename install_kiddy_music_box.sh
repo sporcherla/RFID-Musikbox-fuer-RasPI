@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # ==================================================================
 #  kiddy-music-box – Installer (RFID + MPD + FastAPI + Kiosk)
+#  + Optional: Samba Share
+#  + Optional: Pimoroni OnOff SHIM (Power-Taste & sauberes Abschalten)
+#  + Fixes: Delete-Buttons, Toast-Meldungen, Reiter-UI
 #  Raspberry Pi 3B+ oder höher, Raspberry Pi OS Lite (Bullseye/Bookworm)
-#
-#  Diese Version:
-#   • FIX Admin-Reiter: RFID & Radios laden/anzeigen zuverlässig
-#   • /api/rfid spielt Mappings (Folder/Radio/URL) ab
-#   • Kiosk 800x480, Scale/DPI konfigurierbar
-#   • Robuster Neuftech-USB-Reader, MPD/Uploads gefixt
 # ==================================================================
 
 set -euo pipefail
@@ -28,6 +25,7 @@ MPD_CONF="/etc/mpd.conf"
 
 SERVICE_WEB="kmb-web"
 SERVICE_RFID="kmb-rfid"
+SERVICE_ONOFF="onoffshim"
 
 CODENAME="$(. /etc/os-release; echo "${VERSION_CODENAME:-}")"
 if command -v chromium >/dev/null 2>&1; then
@@ -46,12 +44,12 @@ read -r -p "Xft DPI (96–140) [110]: " KMB_DPI_INPUT || true
 KMB_DPI="${KMB_DPI_INPUT:-110}"
 
 # -------------------- Schritt 1: Pakete ----------------------
-echo "==> [1/20] Pakete (IPv4 erzwingen)…"
+echo "==> [1/24] Pakete (IPv4 erzwingen)…"
 echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null || true
 
 sudo apt update
 sudo apt install -y \
-  mpd mpc python3-pip git curl python3-evdev \
+  mpd mpc ffmpeg python3-pip git curl python3-evdev \
   xserver-xorg x11-xserver-utils xinit openbox unclutter \
   fonts-dejavu-core
 
@@ -64,18 +62,18 @@ if ! command -v "$BROWSER" >/dev/null 2>&1; then
   fi
 fi
 
-echo "==> [2/20] Python-Abhängigkeiten…"
+echo "==> [2/24] Python-Abhängigkeiten…"
 pip3 install --break-system-packages fastapi "uvicorn[standard]" python-mpd2 requests python-multipart aiofiles
 
 # -------------------- Schritt 2: Verzeichnisse ---------------
-echo "==> [3/20] Verzeichnisse…"
+echo "==> [3/24] Verzeichnisse…"
 mkdir -p "$APP_DIR/static" "$RFID_DIR" "$AUDIOFOLDERS" "$SHORTCUTS"
 chown -R "$PI_USER":"$PI_USER" "$ROOT_DIR"
 mkdir -p "$PI_HOME/RPi-Jukebox-RFID"
 [ -e "$PI_HOME/RPi-Jukebox-RFID/shared" ] || ln -s "$SHARED" "$PI_HOME/RPi-Jukebox-RFID/shared"
 
 # -------------------- Schritt 3: MPD konfigurieren ----------
-echo "==> [4/20] MPD-Konfiguration…"
+echo "==> [4/24] MPD-Konfiguration…"
 USE_PULSE="no"; USE_PIPEWIRE="no"
 if pactl info >/dev/null 2>&1 || command -v pulseaudio >/dev/null 2>&1; then USE_PULSE="yes"; fi
 if command -v pw-cli >/dev/null 2>&1 || systemctl --user status pipewire >/dev/null 2>&1; then USE_PIPEWIRE="yes"; fi
@@ -139,23 +137,23 @@ sleep 1
 mpc update || true
 
 # -------------------- Schritt 4: Radios Basisdatei ----------
-echo "==> [5/20] Radios-Datei…"
+echo "==> [5/24] Radios-Datei…"
 cat > "$SHARED/webradios.json" <<'JSON'
 {
   "kids_antenne_bayern": {
     "name": "Antenne Bayern – Hits für Kids",
-    "url": "https://<HIER-DIREKTE-STREAM-URL-EINTRAGEN>"
+    "url": "https://<HIER-DIREKTE-ODER-PLAYLIST-URL>"
   },
   "wdr_maus": {
     "name": "Die Maus im Radio (WDR)",
-    "url": "https://<HIER-DIREKTE-STREAM-URL-EINTRAGEN>"
+    "url": "https://<HIER-DIREKTE-ODER-PLAYLIST-URL>"
   }
 }
 JSON
 chown "$PI_USER":"$PI_USER" "$SHARED/webradios.json"
 
 # -------------------- Schritt 5: Backend ---------------------
-echo "==> [6/20] Backend schreiben…"
+echo "==> [6/24] Backend schreiben…"
 cat > "$APP_DIR/main.py" << 'PY'
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
@@ -165,7 +163,7 @@ from mimetypes import guess_type
 from mpd import MPDClient
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import subprocess, json, io, csv, time
+import subprocess, json, io, csv, time, re, requests, xml.etree.ElementTree as ET
 
 BASE = Path(__file__).resolve().parent
 ROOT = BASE.parent
@@ -221,6 +219,51 @@ def _find_cover_in(folder: Path):
         if pics: return pics[0]
     return None
 
+# ---------- Helper: Stream-URL(s) aus Playlist/URL extrahieren ----------
+PLAYLIST_RE = re.compile(r'^\s*(https?://\S+)\s*$', re.I|re.M)
+def _resolve_stream_urls(url: str) -> List[str]:
+    """Gibt eine Liste spielbarer URLs zurück. Löst .m3u/.pls/.xspf & Redirects auf."""
+    try:
+        resp = requests.get(url, timeout=6, allow_redirects=True, headers={"User-Agent":"kiddy-music-box/1.0"})
+        final_url = resp.url
+        ctype = resp.headers.get("Content-Type","").lower()
+        text = resp.text if "text" in ctype or any(x in final_url for x in (".m3u",".pls",".xspf")) else ""
+    except Exception:
+        return [url]
+
+    # PLS
+    if ".pls" in final_url.lower() or "audio/x-scpls" in ctype:
+        urls=[]
+        for line in text.splitlines():
+            if line.strip().lower().startswith("file"):
+                part=line.split("=",1)
+                if len(part)==2 and part[1].strip().startswith(("http://","https://")):
+                    urls.append(part[1].strip())
+        return urls or [final_url]
+
+    # M3U / M3U8
+    if ".m3u" in final_url.lower() or "audio/x-mpegurl" in ctype or "application/vnd.apple.mpegurl" in ctype:
+        urls=[m.strip() for m in PLAYLIST_RE.findall(text)]
+        return urls or [final_url]
+
+    # XSPF
+    if ".xspf" in final_url.lower() or "application/xspf" in ctype:
+        urls=[]
+        try:
+            root = ET.fromstring(text)
+            for loc in root.findall(".//{http://xspf.org/ns/0/}location"):
+                if loc.text and loc.text.strip().startswith(("http://","https://")):
+                    urls.append(loc.text.strip())
+        except Exception:
+            pass
+        return urls or [final_url]
+
+    # Fallback
+    if text:
+        urls=[m.strip() for m in PLAYLIST_RE.findall(text)]
+        if urls: return urls
+    return [final_url]
+
 # ---------- Player ----------
 class SeekBody(BaseModel): delta_sec: int
 class VolumeBody(BaseModel): volume: int
@@ -273,7 +316,7 @@ def volume(body: VolumeBody):
 def shutdown():
     subprocess.Popen(["sudo","/sbin/shutdown","-h","now"]); return {"ok":True}
 
-# ---------- Webradio: CRUD ----------
+# ---------- Webradio ----------
 class RadioBody(BaseModel):
     id: str
     name: str
@@ -300,14 +343,18 @@ def delete_radio(radio_id: str):
 def play_radio(radio_id: str):
     radios=_load_radios(); r=radios.get(radio_id)
     if not r or not r.get("url"): raise HTTPException(404, "Radio preset not found")
+    urls = _resolve_stream_urls(r["url"])
     c=_mpd()
     try:
-        c.stop(); c.clear(); c.add(r["url"]); c.play()
+        c.stop(); c.clear()
+        for u in urls:
+            c.add(u)
+        c.play()
     finally:
         c.close(); c.disconnect()
-    return {"ok":True,"radio":radio_id}
+    return {"ok":True,"radio":radio_id,"urls":urls}
 
-# ---------- RFID: UID speichern + Mapping auflösen + abspielen ----------
+# ---------- RFID ----------
 class RFIDBody(BaseModel): uid: str
 
 def _interpret_shortcut_content(content: str):
@@ -350,9 +397,13 @@ def rfid(body: RFIDBody):
         if res["type"]=="radio":
             radios=_load_radios(); r=radios.get(res["id"])
             if not r or not r.get("url"): raise HTTPException(404,"Radio preset not found")
-            c.add(r["url"]); c.play(); return {"ok":True,"radio":res["id"]}
+            urls=_resolve_stream_urls(r["url"])
+            for u in urls: c.add(u)
+            c.play(); return {"ok":True,"radio":res["id"],"urls":urls}
         if res["type"]=="url":
-            c.add(res["url"]); c.play(); return {"ok":True,"url":res["url"]}
+            urls=_resolve_stream_urls(res["url"])
+            for u in urls: c.add(u)
+            c.play(); return {"ok":True,"url":urls[0] if urls else res["url"]}
         raise HTTPException(400,"Unbekannter Shortcut-Typ")
     finally:
         c.close(); c.disconnect()
@@ -363,6 +414,20 @@ def last_seen_card():
         try: return json.loads(LAST_SEEN_FILE.read_text(encoding="utf-8"))
         except Exception: pass
     return {"uid": None, "ts": None}
+
+# ---------- Cover ----------
+@app.get("/api/cover")
+def cover():
+    c=_mpd()
+    try:
+        cur=c.currentsong() or {}; rel=cur.get("file")
+    finally:
+        c.close(); c.disconnect()
+    if not rel: raise HTTPException(404,"Kein aktiver Track")
+    folder=(MUSIC_DIR/rel).parent; pic=_find_cover_in(folder)
+    if not pic: raise HTTPException(404,"Kein Cover gefunden")
+    mime,_=guess_type(str(pic))
+    return FileResponse(str(pic), media_type=mime or "image/jpeg")
 
 # ---------- Ordner / Dateien ----------
 @app.get("/api/folders")
@@ -502,7 +567,7 @@ def cards_csv():
 PY
 
 # -------------------- Schritt 6: Frontend -------------------
-echo "==> [7/20] Frontend mit Reitern – FIX IDs & Reloads…"
+echo "==> [7/24] Frontend (DE/EN + Toasts + Delete-Fixes)…"
 cat > "$APP_DIR/static/index.html" << 'HTML'
 <!doctype html>
 <html lang="de">
@@ -512,12 +577,13 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
 <title>Kiddy Music Box</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 980px; margin: 1rem auto; padding: 0 1rem; background:#f6f7fb }
-  .nav { display:flex; gap:.5rem; margin-bottom:1rem }
+  .nav { display:flex; gap:.5rem; margin-bottom:1rem; align-items:center }
   .nav button { padding:.5rem .9rem; border:1px solid #ccc; background:#fff; border-radius:.5rem; cursor:pointer }
   .nav button.active { background:#e9f3ff; border-color:#9cc2ff }
   .grid { display:grid; gap:.75rem; }
   .row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center }
   button { padding:.6rem .9rem; border:1px solid #ccc; border-radius:.5rem; background:#fff; cursor:pointer }
+  button:disabled { opacity:.6; cursor:not-allowed }
   .screen { border:1px solid #ddd; border-radius:.5rem; padding:1rem; background:#fff }
   .title { font-weight:600 }
   .muted { color:#666; font-size:.9rem }
@@ -532,15 +598,29 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
   .dd { border:2px dashed #bbb; border-radius:.5rem; padding:1rem; text-align:center; color:#555; background:#fafafa }
   .dd.drag { background:#eef7ff; border-color:#59f }
   .small { font-size:.9rem }
+  .spacer { flex:1 }
+  /* Toasts */
+  .toasts { position: fixed; right: 1rem; top: 1rem; z-index: 9999; display:flex; flex-direction:column; gap:.5rem }
+  .toast { background:#fff; border-left:4px solid #999; box-shadow:0 6px 20px rgba(0,0,0,.08); padding:.6rem .8rem; border-radius:.4rem; min-width: 220px }
+  .toast.ok { border-left-color:#2ecc71 }
+  .toast.err{ border-left-color:#e74c3c }
 </style>
 </head>
 <body>
+  <div class="toasts" id="toasts"></div>
+
   <h1>Kiddy Music Box</h1>
 
   <div class="nav">
-    <button id="tabPlayerBtn" class="active" onclick="showTab('player')">🎵 Player</button>
-    <button id="tabAdminBtn" onclick="showTab('admin')">🛠️ Admin</button>
-    <a class="small" href="/api/cards.csv" style="margin-left:auto">⬇️ CSV-Export</a>
+    <button id="tabPlayerBtn" class="active" onclick="showTab('player')" data-i18n="nav.player" type="button">🎵 Player</button>
+    <button id="tabAdminBtn" onclick="showTab('admin')" data-i18n="nav.admin" type="button">🛠️ Admin</button>
+    <div class="spacer"></div>
+    <label for="langSel" class="small" data-i18n="nav.language">Sprache</label>
+    <select id="langSel">
+      <option value="de">Deutsch</option>
+      <option value="en">English</option>
+    </select>
+    <a class="small" href="/api/cards.csv" style="margin-left:1rem" data-i18n="nav.csv">⬇️ CSV-Export</a>
   </div>
 
   <!-- Player -->
@@ -552,24 +632,24 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
     </div>
     <img id="cover" alt="Cover" src="/static/placeholder_cover.svg" />
     <div class="row">
-      <button onclick="call('prev')">⏮️</button>
-      <button onclick="call('stop')">⏹️</button>
-      <button onclick="call('pause')">⏸️</button>
-      <button onclick="call('resume')">▶️</button>
-      <button onclick="call('next')">⏭️</button>
+      <button onclick="call('prev')" data-i18n="player.prev" type="button">⏮️</button>
+      <button onclick="call('stop')" data-i18n="player.stop" type="button">⏹️</button>
+      <button onclick="call('pause')" data-i18n="player.pause" type="button">⏸️</button>
+      <button onclick="call('resume')" data-i18n="player.play" type="button">▶️</button>
+      <button onclick="call('next')" data-i18n="player.next" type="button">⏭️</button>
     </div>
     <div class="row">
-      <button onclick="seek(-10)">⏪ 10s</button>
-      <button onclick="seek(10)">⏩ 10s</button>
+      <button onclick="seek(-10)" data-i18n="player.rewind" type="button">⏪ 10s</button>
+      <button onclick="seek(10)" data-i18n="player.forward" type="button">⏩ 10s</button>
     </div>
     <div>
-      <label>Lautstärke</label>
+      <label data-i18n="player.volume">Lautstärke</label>
       <input type="range" min="0" max="100" id="vol" oninput="setVol(this.value)" />
     </div>
     <div class="row">
       <select id="radioSelect"></select>
-      <button onclick="playSelectedRadio()">📻 Radio spielen</button>
-      <button onclick="shutdown()">🛑 Ausschalten</button>
+      <button onclick="playSelectedRadio()" data-i18n="player.playRadio" type="button">📻 Radio spielen</button>
+      <button onclick="shutdown()" data-i18n="player.shutdown" type="button">🛑 Ausschalten</button>
     </div>
   </div>
 
@@ -577,18 +657,18 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
   <div id="tabAdmin" class="grid hidden">
     <div class="screen">
       <div class="tabs">
-        <button id="aTabFolders" class="active" onclick="adminTab('folders')">📁 Ordner</button>
-        <button id="aTabFiles" onclick="adminTab('files')">🗂️ Dateien</button>
-        <button id="aTabRFID" onclick="adminTab('RFID')">🪪 RFID</button>
-        <button id="aTabRadios" onclick="adminTab('Radios')">📻 Radios</button>
+        <button id="aTabFolders" class="active" onclick="adminTab('folders')" data-i18n="admin.tabs.folders" type="button">📁 Ordner</button>
+        <button id="aTabFiles" onclick="adminTab('files')" data-i18n="admin.tabs.files" type="button">🗂️ Dateien</button>
+        <button id="aTabRFID" onclick="adminTab('RFID')" data-i18n="admin.tabs.rfid" type="button">🪪 RFID</button>
+        <button id="aTabRadios" onclick="adminTab('Radios')" data-i18n="admin.tabs.radios" type="button">📻 Radios</button>
       </div>
 
       <!-- Ordner -->
       <div id="adminFolders">
         <div class="row small">
-          <input id="newFolderName" placeholder="Neuer Ordnername">
+          <input id="newFolderName" placeholder="Neuer Ordnername" data-i18n-ph="admin.folders.newName">
           <select id="parentFolderSelect"></select>
-          <button onclick="createFolder()">Ordner anlegen</button>
+          <button onclick="createFolder()" data-i18n="admin.folders.create" type="button">Ordner anlegen</button>
         </div>
         <div class="list" id="folderList"></div>
       </div>
@@ -596,9 +676,9 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
       <!-- Dateien -->
       <div id="adminFiles" class="hidden">
         <div class="row small">
-          <span>Aktueller Ordner: <strong id="curFolderName">–</strong></span>
+          <span data-i18n="admin.files.current">Aktueller Ordner:</span>&nbsp;<strong id="curFolderName">–</strong>
         </div>
-        <div id="dropzone" class="dd">Dateien hierher ziehen & ablegen (Audio/Cover)</div>
+        <div id="dropzone" class="dd" data-i18n="admin.files.drop">Dateien hierher ziehen &amp; ablegen (Audio/Cover)</div>
         <input id="fileInput" type="file" multiple style="margin:.5rem 0">
         <div class="list" id="fileList"></div>
       </div>
@@ -606,25 +686,25 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
       <!-- RFID -->
       <div id="adminRFID" class="hidden">
         <div class="row small">
-          <button onclick="refreshLastSeen()">🧲 Karte auflegen</button>
-          <span>Letzte UID: <strong id="lastUid">–</strong></span>
+          <button onclick="refreshLastSeen()" data-i18n="admin.rfid.tap" type="button">🧲 Karte auflegen</button>
+          <span data-i18n="admin.rfid.last">Letzte UID:</span>&nbsp;<strong id="lastUid">–</strong>
           <span class="muted" id="lastUidAge"></span>
         </div>
         <div class="row small">
-          <input id="uidInput" placeholder="UID eintippen oder übernehmen">
-          <button onclick="useLastUid()">Letzte UID übernehmen</button>
+          <input id="uidInput" placeholder="UID eintippen oder übernehmen" data-i18n-ph="admin.rfid.uidPh">
+          <button onclick="useLastUid()" data-i18n="admin.rfid.take" type="button">Letzte UID übernehmen</button>
         </div>
         <div class="row small">
-          <label>Zieltyp:</label>
+          <label data-i18n="admin.rfid.type">Zieltyp:</label>
           <select id="cardType">
-            <option value="folder">Ordner</option>
-            <option value="radio">Radio</option>
-            <option value="url">Direkte URL</option>
+            <option value="folder" data-i18n="admin.rfid.typeFolder">Ordner</option>
+            <option value="radio" data-i18n="admin.rfid.typeRadio">Radio</option>
+            <option value="url" data-i18n="admin.rfid.typeUrl">Direkte URL</option>
           </select>
           <select id="cardFolder"></select>
           <select id="cardRadio" class="hidden"></select>
-          <input id="cardUrl" class="hidden" placeholder="https://…">
-          <button onclick="saveCard()">Zuordnen/Speichern</button>
+          <input id="cardUrl" class="hidden" placeholder="https://…" data-i18n-ph="admin.rfid.urlPh">
+          <button onclick="saveCard()" data-i18n="admin.rfid.save" type="button">Zuordnen/Speichern</button>
         </div>
         <div class="list" id="cardList"></div>
       </div>
@@ -632,10 +712,10 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
       <!-- Radios -->
       <div id="adminRadios" class="hidden">
         <div class="row small">
-          <input id="rId" placeholder="ID (z.B. kids_antenne_bayern)">
-          <input id="rName" placeholder="Anzeigename">
-          <input id="rUrl" placeholder="Direkte Stream-URL (mp3/aac)">
-          <button onclick="saveRadio()">Speichern</button>
+          <input id="rId" placeholder="ID (z.B. kids_antenne_bayern)" data-i18n-ph="admin.radios.idPh">
+          <input id="rName" placeholder="Anzeigename" data-i18n-ph="admin.radios.namePh">
+          <input id="rUrl" placeholder="Direkte oder Playlist-URL" data-i18n-ph="admin.radios.urlPh">
+          <button onclick="saveRadio()" data-i18n="admin.radios.save" type="button">Speichern</button>
         </div>
         <div class="list" id="radioList"></div>
       </div>
@@ -649,7 +729,77 @@ cat > "$APP_DIR/static/index.html" << 'HTML'
 HTML
 
 cat > "$APP_DIR/static/app.js" << 'JS'
-/* --------- Tab-Steuerung --------- */
+/* ================= Toasts ================= */
+function toast(msg, ok=true){
+  const box = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (ok ? 'ok':'err');
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(()=>{ el.remove(); }, 3000);
+}
+
+/* ================= I18N ================= */
+const I18N = {
+  de: {
+    "nav.player":"🎵 Player","nav.admin":"🛠️ Admin","nav.language":"Sprache","nav.csv":"⬇️ CSV-Export",
+    "player.prev":"⏮️","player.stop":"⏹️","player.pause":"⏸️","player.play":"▶️","player.next":"⏭️",
+    "player.rewind":"⏪ 10s","player.forward":"⏩ 10s","player.volume":"Lautstärke","player.playRadio":"📻 Radio spielen","player.shutdown":"🛑 Ausschalten",
+    "admin.tabs.folders":"📁 Ordner","admin.tabs.files":"🗂️ Dateien","admin.tabs.rfid":"🪪 RFID","admin.tabs.radios":"📻 Radios",
+    "admin.folders.newName":"Neuer Ordnername","admin.folders.create":"Ordner anlegen",
+    "admin.files.current":"Aktueller Ordner:","admin.files.drop":"Dateien hierher ziehen & ablegen (Audio/Cover)",
+    "admin.rfid.tap":"🧲 Karte auflegen","admin.rfid.last":"Letzte UID:","admin.rfid.uidPh":"UID eintippen oder übernehmen",
+    "admin.rfid.take":"Letzte UID übernehmen","admin.rfid.type":"Zieltyp:","admin.rfid.typeFolder":"Ordner","admin.rfid.typeRadio":"Radio","admin.rfid.typeUrl":"Direkte URL",
+    "admin.rfid.urlPh":"https://…","admin.rfid.save":"Zuordnen/Speichern",
+    "admin.radios.idPh":"ID (z.B. kids_antenne_bayern)","admin.radios.namePh":"Anzeigename","admin.radios.urlPh":"Direkte oder Playlist-URL","admin.radios.save":"Speichern",
+    "msg.enterName":"Bitte Ordnername eingeben","msg.folderCreateErr":"Fehler beim Anlegen",
+    "msg.folderDeleteConfirm":"Ordner löschen? (nur wenn leer)\n","msg.folderDeleteErr":"Fehler (Ordner evtl. nicht leer)",
+    "msg.selectFolderFirst":"Bitte zuerst einen Ordner wählen","msg.uploadFail":"Upload fehlgeschlagen",
+    "msg.cardNeedUid":"Bitte UID eingeben","msg.cardNeedFolder":"Ordner wählen","msg.cardNeedRadio":"Radio wählen","msg.cardNeedUrl":"URL eingeben",
+    "msg.saveErr":"Fehler beim Speichern","msg.saved":"Gespeichert","msg.cardDeleteConfirm":"Zuordnung löschen?\n","msg.cardDeleteErr":"Fehler beim Löschen",
+    "msg.radioDeleteConfirm":"Radio löschen?\n","msg.radioDeleteErr":"Fehler beim Löschen","msg.shutdownConfirm":"Raspberry jetzt herunterfahren?",
+    "msg.deleted":"Gelöscht"
+  },
+  en: {
+    "nav.player":"🎵 Player","nav.admin":"🛠️ Admin","nav.language":"Language","nav.csv":"⬇️ CSV export",
+    "player.prev":"⏮️","player.stop":"⏹️","player.pause":"⏸️","player.play":"▶️","player.next":"⏭️",
+    "player.rewind":"⏪ 10s","player.forward":"⏩ 10s","player.volume":"Volume","player.playRadio":"📻 Play radio","player.shutdown":"🛑 Shutdown",
+    "admin.tabs.folders":"📁 Folders","admin.tabs.files":"🗂️ Files","admin.tabs.rfid":"🪪 RFID","admin.tabs.radios":"📻 Radios",
+    "admin.folders.newName":"New folder name","admin.folders.create":"Create folder",
+    "admin.files.current":"Current folder:","admin.files.drop":"Drag & drop files here (audio/cover)",
+    "admin.rfid.tap":"🧲 Tap a card","admin.rfid.last":"Last UID:","admin.rfid.uidPh":"Type or use last UID",
+    "admin.rfid.take":"Use last UID","admin.rfid.type":"Target type:","admin.rfid.typeFolder":"Folder","admin.rfid.typeRadio":"Radio","admin.rfid.typeUrl":"Direct URL",
+    "admin.rfid.urlPh":"https://…","admin.rfid.save":"Assign / Save",
+    "admin.radios.idPh":"ID (e.g. kids_antenne_bayern)","admin.radios.namePh":"Display name","admin.radios.urlPh":"Direct or playlist URL","admin.radios.save":"Save",
+    "msg.enterName":"Please enter a folder name","msg.folderCreateErr":"Error creating folder",
+    "msg.folderDeleteConfirm":"Delete folder? (only if empty)\n","msg.folderDeleteErr":"Error (folder may not be empty)",
+    "msg.selectFolderFirst":"Please select a folder first","msg.uploadFail":"Upload failed",
+    "msg.cardNeedUid":"Please enter UID","msg.cardNeedFolder":"Choose a folder","msg.cardNeedRadio":"Choose a radio","msg.cardNeedUrl":"Enter a URL",
+    "msg.saveErr":"Save failed","msg.saved":"Saved","msg.cardDeleteConfirm":"Delete mapping?\n","msg.cardDeleteErr":"Delete failed",
+    "msg.radioDeleteConfirm":"Delete radio?\n","msg.radioDeleteErr":"Delete failed","msg.shutdownConfirm":"Shutdown Raspberry now?",
+    "msg.deleted":"Deleted"
+  }
+};
+function getLang(){ return localStorage.getItem('kmb_lang') || 'de'; }
+function setLang(l){ localStorage.setItem('kmb_lang', l); applyI18n(); }
+function applyI18n(){
+  const lang=getLang(); const dict=I18N[lang]||I18N.de;
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-i18n]').forEach(el=>{
+    const key=el.getAttribute('data-i18n'); if(dict[key]) el.textContent = dict[key];
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{
+    const key=el.getAttribute('data-i18n-ph'); if(dict[key]) el.setAttribute('placeholder', dict[key]);
+  });
+  const sel=document.getElementById('langSel'); if(sel) sel.value = lang;
+}
+document.addEventListener('DOMContentLoaded', ()=>{
+  const sel=document.getElementById('langSel');
+  if(sel){ sel.value=getLang(); sel.addEventListener('change', e=>setLang(e.target.value)); }
+  applyI18n();
+});
+
+/* ================= TABS / ADMIN ================= */
 function showTab(name){
   const isAdmin = name==='admin';
   document.getElementById('tabPlayer').classList.toggle('hidden', isAdmin);
@@ -658,15 +808,12 @@ function showTab(name){
   document.getElementById('tabAdminBtn').classList.toggle('active', isAdmin);
   if(isAdmin){ loadAdmin(); adminTab('folders'); }
 }
-
-/* Feste ID-Map: vermeidet Schreibfehler (RFID/Radios) */
 const ADMIN_IDS = {
   folders: {panel:'adminFolders', btn:'aTabFolders', onshow: ()=>loadFolders()},
-  files:   {panel:'adminFiles',   btn:'aTabFiles',   onshow: ()=>{/* bleibt leer */}},
+  files:   {panel:'adminFiles',   btn:'aTabFiles',   onshow: ()=>{/* noop */}},
   RFID:    {panel:'adminRFID',    btn:'aTabRFID',    onshow: ()=>{loadCards(); refreshLastSeen();}},
   Radios:  {panel:'adminRadios',  btn:'aTabRadios',  onshow: ()=>loadRadios()},
 };
-
 function adminTab(key){
   Object.entries(ADMIN_IDS).forEach(([k,def])=>{
     document.getElementById(def.panel)?.classList.toggle('hidden', k!==key);
@@ -675,11 +822,19 @@ function adminTab(key){
   ADMIN_IDS[key]?.onshow?.();
 }
 
-/* --------- Player-Steuerung --------- */
-async function call(action){ await fetch(`/api/${action}`, {method:'POST'}); refresh(); }
-async function seek(delta){ await fetch(`/api/seek`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({delta_sec:delta})}); refresh(); }
+/* ================= PLAYER ================= */
+async function call(action){ 
+  const r = await fetch(`/api/${action}`, {method:'POST'}); 
+  r.ok ? toast('OK', true) : toast('Error', false);
+  refresh(); 
+}
+async function seek(delta){ 
+  const r = await fetch(`/api/seek`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({delta_sec:delta})}); 
+  r.ok ? toast('Seek', true) : toast('Seek error', false);
+  refresh(); 
+}
 async function setVol(v){ await fetch(`/api/volume`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({volume:parseInt(v)})}); }
-async function shutdown(){ if(confirm("Raspberry jetzt herunterfahren?")){ await fetch(`/api/shutdown`, {method:'POST'}); } }
+async function shutdown(){ if(confirm(I18N[getLang()].msg.shutdownConfirm)){ await fetch(`/api/shutdown`, {method:'POST'}); } }
 function setCover(){ const img=document.getElementById('cover'); if(!img) return; img.onerror=()=>{img.src='/static/placeholder_cover.svg'}; img.src=`/api/cover?ts=${Date.now()}`; }
 async function refresh(){
   const r=await fetch('/api/state'); const s=await r.json();
@@ -693,7 +848,7 @@ async function refresh(){
   setCover();
 }
 
-/* --------- Radios --------- */
+/* ================= RADIOS ================= */
 async function loadRadios(){
   const r = await fetch('/api/radios'); const radios = await r.json();
   const sel = document.getElementById('radioSelect');
@@ -709,9 +864,10 @@ async function loadRadios(){
     if(cardRadio){ const opt2 = document.createElement('option'); opt2.value=id; opt2.textContent=name; cardRadio.appendChild(opt2); }
     if(list){
       const row = document.createElement('div'); row.className='row small';
-      row.innerHTML = `<code style="flex:1">${id}</code><span style="flex:1">${name}</span><span style="flex:2">${url}</span>
-                       <button onclick="prefillRadio('${id}')">Bearb.</button>
-                       <button onclick="delRadio('${id}')">Löschen</button>`;
+      const safeId = id.replace(/"/g,'&quot;');
+      row.innerHTML = `<code style="flex:1">${safeId}</code><span style="flex:1">${name}</span><span style="flex:2">${url}</span>
+                       <button type="button" onclick="prefillRadio('${safeId}')">✏️</button>
+                       <button type="button" onclick="delRadio('${safeId}')">🗑️</button>`;
       list.appendChild(row);
     }
   });
@@ -726,40 +882,45 @@ function prefillRadio(id){
   });
 }
 async function saveRadio(){
+  const T = I18N[getLang()];
   const id = document.getElementById('rId').value.trim();
   const name = document.getElementById('rName').value.trim();
   const url = document.getElementById('rUrl').value.trim();
-  if(!id || !name || !url){ alert('Bitte ID, Name und URL angeben'); return; }
+  if(!id || !name || !url){ toast(T.msg.saveErr,false); return; }
   const r = await fetch('/api/radios', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id, name, url})});
-  if(!r.ok){ alert('Fehler beim Speichern'); return; }
+  if(!r.ok){ toast(T.msg.saveErr,false); return; }
   document.getElementById('rId').value=''; document.getElementById('rName').value=''; document.getElementById('rUrl').value='';
-  await loadRadios(); alert('Gespeichert');
+  await loadRadios(); toast(T.msg.saved,true);
 }
 async function delRadio(id){
-  if(!confirm(`Radio löschen?\n${id}`)) return;
+  const T = I18N[getLang()];
+  if(!confirm(T.msg.radioDeleteConfirm+id)) return;
   const r = await fetch(`/api/radios/${encodeURIComponent(id)}`, {method:'DELETE'});
-  if(!r.ok){ alert('Fehler beim Löschen'); return; }
-  await loadRadios();
+  if(!r.ok){ toast(T.msg.radioDeleteErr,false); return; }
+  await loadRadios(); toast(T.msg.deleted,true);
 }
 async function playSelectedRadio(){
   const sel = document.getElementById('radioSelect'); if(!sel || !sel.value) return;
-  await fetch(`/api/radio/${encodeURIComponent(sel.value)}/play`, {method:'POST'}); setTimeout(refresh, 300);
+  const r = await fetch(`/api/radio/${encodeURIComponent(sel.value)}/play`, {method:'POST'});
+  r.ok ? toast('Radio ▶', true) : toast('Radio ❌', false);
+  setTimeout(refresh, 300);
 }
 
-/* --------- Ordner/Dateien --------- */
+/* ================= FOLDERS/FILES ================= */
 async function loadFolders(){
   const r = await fetch('/api/folders?deep=true'); const data = await r.json();
   const list = document.getElementById('folderList');
   const selParent = document.getElementById('parentFolderSelect');
   const selCardFolder = document.getElementById('cardFolder');
-  if(selParent){ selParent.innerHTML=''; const o=document.createElement('option'); o.value=''; o.textContent='(Wurzel)'; selParent.appendChild(o); }
+  if(selParent){ selParent.innerHTML=''; const o=document.createElement('option'); o.value=''; o.textContent='(root)'; selParent.appendChild(o); }
   if(selCardFolder){ selCardFolder.innerHTML=''; }
   if(list) list.innerHTML = '';
   (data.folders||[]).forEach(rel=>{
     if(list){
       const row = document.createElement('div'); row.className='row small';
-      row.innerHTML = `<a href="#" onclick="selectFolder('${rel}');adminTab('files');return false;" style="flex:1">${rel}</a>
-                       <button onclick="deleteFolder('${rel}')">Löschen</button>`;
+      const safeRel = rel.replace(/"/g,'&quot;');
+      row.innerHTML = `<a href="#" onclick="selectFolder('${safeRel}');adminTab('files');return false;" style="flex:1">${safeRel}</a>
+                       <button type="button" onclick="deleteFolder('${safeRel}')">🗑️</button>`;
       list.appendChild(row);
     }
     if(selParent){ const optP = document.createElement('option'); optP.value=rel; optP.textContent=rel; selParent.appendChild(optP); }
@@ -767,20 +928,23 @@ async function loadFolders(){
   });
 }
 async function createFolder(){
+  const T = I18N[getLang()];
   const name = document.getElementById('newFolderName').value.trim();
   const parent = document.getElementById('parentFolderSelect').value || null;
-  if(!name){ alert('Bitte Ordnername eingeben'); return; }
+  if(!name){ toast(T.msg.enterName,false); return; }
   const r = await fetch('/api/folders', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, parent})});
-  if(!r.ok){ alert('Fehler beim Anlegen'); return; }
-  document.getElementById('newFolderName').value=''; await loadFolders();
+  if(!r.ok){ toast(T.msg.folderCreateErr,false); return; }
+  document.getElementById('newFolderName').value=''; await loadFolders(); toast(I18N[getLang()].msg.saved,true);
 }
 async function deleteFolder(rel){
-  if(!confirm(`Ordner löschen? (nur wenn leer)\n${rel}`)) return;
+  const T = I18N[getLang()];
+  if(!confirm(T.msg.folderDeleteConfirm+rel)) return;
   const r = await fetch(`/api/folders?path=${encodeURIComponent(rel)}`, {method:'DELETE'});
-  if(!r.ok){ alert('Fehler (Ordner evtl. nicht leer)'); return; }
+  if(!r.ok){ toast(T.msg.folderDeleteErr,false); return; }
   await loadFolders();
   const cur = document.getElementById('curFolderName').textContent;
   if(cur===rel){ document.getElementById('fileList').innerHTML=''; document.getElementById('curFolderName').textContent='–'; }
+  toast(T.msg.deleted,true);
 }
 async function selectFolder(rel){
   document.getElementById('curFolderName').textContent = rel;
@@ -789,17 +953,19 @@ async function selectFolder(rel){
   if(list) list.innerHTML = '';
   (data.files||[]).forEach(f=>{
     const row = document.createElement('div'); row.className='row small';
-    row.innerHTML = `<span style="flex:1">${f.name}</span>
+    const safeName = f.name.replace(/"/g,'&quot;');
+    row.innerHTML = `<span style="flex:1">${safeName}</span>
                      <span class="muted" style="width:100px;text-align:right">${(f.size/1024).toFixed(1)} KB</span>
-                     <button onclick="deleteFile('${data.folder}','${f.name}')">🗑️</button>`;
+                     <button type="button" onclick="deleteFile('${data.folder}','${safeName}')">🗑️</button>`;
     list.appendChild(row);
   });
 }
 async function deleteFile(folder, name){
-  if(!confirm(`Datei löschen?\n${name}`)) return;
+  const T = I18N[getLang()];
+  if(!confirm(T.msg.cardDeleteConfirm+name)) return;
   const r = await fetch(`/api/file?path=${encodeURIComponent(folder)}&name=${encodeURIComponent(name)}`, {method:'DELETE'});
-  if(!r.ok){ alert('Fehler beim Löschen'); return; }
-  await selectFolder(folder);
+  if(!r.ok){ toast(T.msg.cardDeleteErr,false); return; }
+  await selectFolder(folder); toast(T.msg.deleted,true);
 }
 const dz = document.getElementById('dropzone');
 const fi = document.getElementById('fileInput');
@@ -807,28 +973,31 @@ if(dz){
   ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev, (e)=>{e.preventDefault(); dz.classList.add('drag');}));
   ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev, (e)=>{e.preventDefault(); dz.classList.remove('drag');}));
   dz.addEventListener('drop', async (e)=>{
+    const T = I18N[getLang()];
     const rel = document.getElementById('curFolderName').textContent;
-    if(!rel || rel==='–'){ alert('Bitte zuerst einen Ordner wählen'); return; }
+    if(!rel || rel==='–'){ toast(T.msg.selectFolderFirst,false); return; }
     const files = e.dataTransfer.files; if(!files.length) return;
     await doUpload(rel, files);
   });
 }
 if(fi){
   fi.addEventListener('change', async ()=>{
+    const T = I18N[getLang()];
     const rel = document.getElementById('curFolderName').textContent;
-    if(!rel || rel==='–'){ alert('Bitte zuerst einen Ordner wählen'); fi.value=''; return; }
+    if(!rel || rel==='–'){ toast(T.msg.selectFolderFirst,false); fi.value=''; return; }
     await doUpload(rel, fi.files); fi.value='';
   });
 }
 async function doUpload(rel, files){
+  const T = I18N[getLang()];
   const fd = new FormData(); fd.append('path', rel);
   for(const f of files){ fd.append('files', f); }
   const r = await fetch('/api/upload', {method:'POST', body: fd});
-  if(!r.ok){ alert('Upload fehlgeschlagen'); return; }
-  await selectFolder(rel);
+  if(!r.ok){ toast(T.msg.uploadFail,false); return; }
+  await selectFolder(rel); toast(I18N[getLang()].msg.saved,true);
 }
 
-/* --------- RFID --------- */
+/* ================= RFID ================= */
 function onTypeChange(){
   const t = document.getElementById('cardType').value;
   document.getElementById('cardFolder').classList.toggle('hidden', t!=='folder');
@@ -843,42 +1012,39 @@ async function loadCards(){
   el.innerHTML = '';
   cards.forEach(c=>{
     const row = document.createElement('div'); row.className='row small';
-    row.innerHTML = `<span style="width:160px"><code>${c.uid||''}</code></span>
+    const uid = (c.uid||'').replace(/"/g,'&quot;');
+    const tgt = (c.target||'').replace(/"/g,'&quot;');
+    row.innerHTML = `<span style="width:160px"><code>${uid}</code></span>
                      <span style="width:80px">${c.type||''}</span>
-                     <span style="flex:1">${c.target||''}</span>
-                     <button onclick="delCard('${c.uid}')">🗑️</button>`;
+                     <span style="flex:1">${tgt}</span>
+                     <button type="button" onclick="delCard('${uid}')">🗑️</button>`;
     el.appendChild(row);
   });
 }
 async function saveCard(){
-  const uid = document.getElementById('uidInput').value.trim(); if(!uid){ alert('Bitte UID eingeben'); return; }
+  const T = I18N[getLang()];
+  const uid = document.getElementById('uidInput').value.trim(); if(!uid){ toast(T.msg.cardNeedUid,false); return; }
   const type = document.getElementById('cardType').value; let target = '';
-  if(type==='folder'){ target = document.getElementById('cardFolder').value; if(!target){ alert('Ordner wählen'); return; } }
-  if(type==='radio'){ target = document.getElementById('cardRadio').value; if(!target){ alert('Radio wählen'); return; } }
-  if(type==='url'){ target = document.getElementById('cardUrl').value.trim(); if(!target){ alert('URL eingeben'); return; } }
+  if(type==='folder'){ target = document.getElementById('cardFolder').value; if(!target){ toast(T.msg.cardNeedFolder,false); return; } }
+  if(type==='radio'){ target = document.getElementById('cardRadio').value; if(!target){ toast(T.msg.cardNeedRadio,false); return; } }
+  if(type==='url'){ target = document.getElementById('cardUrl').value.trim(); if(!target){ toast(T.msg.cardNeedUrl,false); return; } }
   const r = await fetch('/api/cards', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uid, type, target})});
-  if(!r.ok){ alert('Fehler beim Speichern'); return; }
-  await loadCards(); alert('Gespeichert');
+  if(!r.ok){ toast(T.msg.saveErr,false); return; }
+  await loadCards(); toast(I18N[getLang()].msg.saved,true);
 }
 async function delCard(uid){
-  if(!confirm(`Zuordnung für ${uid} löschen?`)) return;
+  const T = I18N[getLang()];
+  if(!confirm(T.msg.cardDeleteConfirm+uid)) return;
   const r = await fetch(`/api/cards/${encodeURIComponent(uid)}`, {method:'DELETE'});
-  if(!r.ok){ alert('Fehler beim Löschen'); return; }
-  await loadCards();
+  if(!r.ok){ toast(T.msg.cardDeleteErr,false); return; }
+  await loadCards(); toast(T.msg.deleted,true);
 }
-async function refreshLastSeen(){
-  const r = await fetch('/api/cards/last_seen'); const d = await r.json();
-  const uid = d.uid || '–'; document.getElementById('lastUid').textContent = uid;
-  if(d.ts){ const age = Math.max(0, Math.floor(Date.now()/1000 - d.ts)); document.getElementById('lastUidAge').textContent = `(${age}s)`; }
-  else { document.getElementById('lastUidAge').textContent = ''; }
-}
-function useLastUid(){ const uid = document.getElementById('lastUid').textContent; if(uid && uid!=='–'){ document.getElementById('uidInput').value = uid; } }
 
-/* --------- Admin Init --------- */
+/* ================= INIT ================= */
 async function loadAdmin(){ await loadFolders(); await loadRadios(); await loadCards(); onTypeChange(); }
-
-/* --------- Ticker --------- */
 setInterval(refresh, 1500); refresh(); loadRadios();
+function initLang(){ const sel=document.getElementById('langSel'); if(sel){ sel.value=getLang(); sel.addEventListener('change', e=>setLang(e.target.value)); } applyI18n(); }
+initLang();
 showTab('player');
 JS
 
@@ -887,7 +1053,7 @@ cat > "$APP_DIR/static/placeholder_cover.svg" << 'SVG'
 SVG
 
 # -------------------- Schritt 7: RFID Reader -----------------
-echo "==> [8/20] RFID-Reader (Neuftech USB-HID)…"
+echo "==> [8/24] RFID-Reader (Neuftech USB-HID)…"
 cat > "$RFID_DIR/reader_usb.py" << 'PY'
 #!/usr/bin/env python3
 import time, logging, requests, select
@@ -988,14 +1154,14 @@ chmod +x "$RFID_DIR/reader_usb.py"
 chown -R "$PI_USER":"$PI_USER" "$ROOT_DIR"
 
 # -------------------- Schritt 8: udev-Regel ------------------
-echo "==> [9/20] udev-Regel (input-Gruppe)…"
+echo "==> [9/24] udev-Regel (input-Gruppe)…"
 echo 'KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-input.rules >/dev/null
 sudo udevadm control --reload || true
 sudo udevadm trigger || true
 sudo usermod -a -G input "$PI_USER" || true
 
 # -------------------- Schritt 9: Services --------------------
-echo "==> [10/20] Services (Web & RFID)…"
+echo "==> [10/24] Services (Web & RFID)…"
 sudo tee /etc/systemd/system/${SERVICE_WEB}.service >/dev/null <<SERVICE
 [Unit]
 Description=kiddy-music-box Web (FastAPI)
@@ -1027,7 +1193,7 @@ WantedBy=multi-user.target
 SERVICE
 
 # -------------------- Schritt 10: Kiosk (Autologin + 800x480)
-echo "==> [11/20] Kiosk via Autologin + ~/.bash_profile + xrandr 800x480…"
+echo "==> [11/24] Kiosk via Autologin + ~/.bash_profile + xrandr 800x480…"
 
 sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
 sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
@@ -1070,25 +1236,151 @@ BASH"
 sudo -u "$PI_USER" bash -lc "echo 'exec openbox-session' > '$PI_HOME/.xinitrc'"
 
 # -------------------- Schritt 11: Berechtigungen -------------
-echo "==> [12/20] Shutdown ohne Passwort…"
+echo "==> [12/24] Shutdown ohne Passwort…"
 echo "$PI_USER ALL=NOPASSWD:/sbin/shutdown" | sudo tee /etc/sudoers.d/kiddy-music-box >/dev/null
 
 # -------------------- Schritt 12: Dienste starten ------------
-echo "==> [13/20] Dienste aktivieren…"
+echo "==> [13/24] Dienste aktivieren…"
 sudo systemctl daemon-reload
 sudo systemctl enable --now mpd ${SERVICE_WEB} ${SERVICE_RFID}
 
-# -------------------- Schritt 13: Hinweise -------------------
-echo "==> [14/20] Hinweis: ggf. einmal ab-/anmelden (input-Gruppe)."
-
-# -------------------- Schritt 14: Schnelltests ---------------
-echo "==> [15/20] API-Check…"; sleep 1
+# -------------------- Schritt 13: Schnelltests ---------------
+echo "==> [14/24] API-Check…"; sleep 1
 curl -sS http://127.0.0.1:$PORT/api/state || true
-echo "==> [16/20] RFID-Log (letzte 20)…"
+echo "==> [15/24] RFID-Log (letzte 20)…"
 sudo journalctl -u ${SERVICE_RFID} -n 20 --no-pager || true
 
-# -------------------- Schritt 15: config.txt (optional) ------
-echo "==> [17/20] Optional: framebuffer 800x480 in /boot/config.txt setzen?"
+# -------------------- Schritt 14: OPTIONAL SAMBA -------------
+echo "==> [16/24] Optionale Samba-Freigabe einrichten?"
+read -r -p "Samba aktivieren? (y/N) " SMB_YN || true
+if [[ "${SMB_YN,,}" == "y" ]]; then
+  echo "==> Samba wird installiert…"
+  sudo apt install -y samba
+  read -r -p "Workgroup (Windows) [WORKGROUP]: " SMB_WG || true
+  SMB_WG="${SMB_WG:-WORKGROUP}"
+  echo "Modus wählen:"
+  echo "  1) Gastzugriff (read-only)"
+  echo "  2) Authentifiziert (read/write, Benutzer $PI_USER)"
+  read -r -p "Auswahl [1/2, Standard 1]: " SMB_MODE || true
+  SMB_MODE="${SMB_MODE:-1}"
+  SHARE_NAME="kmb-music"
+  if [ -f /etc/samba/smb.conf ]; then
+    sudo cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%s)
+  fi
+  sudo tee /etc/samba/smb.conf >/dev/null <<EOF
+[global]
+   workgroup = ${SMB_WG}
+   server string = kiddy-music-box
+   netbios name = $(hostname)
+   dns proxy = no
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   server role = standalone server
+   obey pam restrictions = yes
+   map to guest = Bad User
+   usershare allow guests = yes
+   create mask = 0664
+   directory mask = 0775
+EOF
+  if [[ "$SMB_MODE" == "1" ]]; then
+    sudo tee -a /etc/samba/smb.conf >/dev/null <<EOF
+
+[${SHARE_NAME}]
+   path = ${AUDIOFOLDERS}
+   browseable = yes
+   read only = yes
+   guest ok = yes
+   force user = ${PI_USER}
+   force group = audio
+EOF
+  else
+    sudo tee -a /etc/samba/smb.conf >/dev/null <<EOF
+
+[${SHARE_NAME}]
+   path = ${AUDIOFOLDERS}
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = ${PI_USER}
+   force user = ${PI_USER}
+   force group = audio
+   create mask = 0664
+   directory mask = 0775
+EOF
+    sudo smbpasswd -a "${PI_USER}" || true
+  fi
+  sudo usermod -a -G audio "${PI_USER}" || true
+  sudo chgrp -R audio "${AUDIOFOLDERS}" || true
+  sudo chmod -R 775 "${AUDIOFOLDERS}" || true
+  sudo systemctl enable --now smbd nmbd
+  sudo systemctl restart smbd nmbd
+else
+  echo "==> Samba übersprungen."
+fi
+
+# -------------------- Schritt 15: OPTIONAL OnOff SHIM -------
+echo "==> [17/24] Pimoroni OnOff SHIM optional einbinden?"
+echo "    • Button an BCM17 -> Shutdown"
+echo "    • Power-Off Signal BCM4 (low) via gpio-poweroff Overlay"
+read -r -p "OnOff SHIM aktivieren? (y/N) " ONOFF_YN || true
+if [[ "${ONOFF_YN,,}" == "y" ]]; then
+  echo "==> Installiere OnOff SHIM Service…"
+  sudo apt install -y python3-rpi.gpio
+  sudo tee /usr/local/bin/onoffshim.py >/dev/null <<'PY'
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO, time, os, signal, sys
+BTN=17     # Pimoroni OnOff SHIM button (BCM17)
+HOLD=1.0   # Sek. Tastendruck bis Shutdown
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BTN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+def shutdown(*_):
+    os.system("sudo /sbin/shutdown -h now")
+def loop():
+    while True:
+        if GPIO.input(BTN)==0:
+            t0=time.time()
+            while GPIO.input(BTN)==0:
+                time.sleep(0.02)
+            if time.time()-t0>=HOLD:
+                shutdown()
+        time.sleep(0.05)
+def cleanup(*_):
+    GPIO.cleanup(); sys.exit(0)
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
+try: loop()
+finally: cleanup()
+PY
+  sudo chmod +x /usr/local/bin/onoffshim.py
+
+  sudo tee /etc/systemd/system/${SERVICE_ONOFF}.service >/dev/null <<SERVICE
+[Unit]
+Description=Pimoroni OnOff SHIM Listener
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/onoffshim.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  # gpio-poweroff Overlay (BCM4 low bei Poweroff)
+  if ! grep -q '^dtoverlay=gpio-poweroff' /boot/config.txt 2>/dev/null; then
+    echo "dtoverlay=gpio-poweroff,gpiopin=4,active_low=1,input=1" | sudo tee -a /boot/config.txt >/dev/null
+  fi
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now ${SERVICE_ONOFF}
+  echo "==> OnOff SHIM aktiv. Taste >1s: Shutdown. Netzteil erst trennen, wenn Pi aus ist."
+else
+  echo "==> OnOff SHIM übersprungen."
+fi
+
+# -------------------- Schritt 16: config.txt (optional) ------
+echo "==> [18/24] Optional: framebuffer 800x480 in /boot/config.txt setzen?"
 read -r -p "config.txt anpassen (framebuffer_width/height)? (y/N) " yn || true
 if [[ "${yn,,}" == "y" ]]; then
   sudo sed -i '/^#*framebuffer_width=/d;/^#*framebuffer_height=/d' /boot/config.txt
@@ -1096,8 +1388,8 @@ if [[ "${yn,,}" == "y" ]]; then
   echo "framebuffer_height=480" | sudo tee -a /boot/config.txt >/dev/null
 fi
 
-# -------------------- Schritt 16: Feste IP (optional) --------
-echo "==> [18/20] (Optional) feste IP setzen"
+# -------------------- Schritt 17: Feste IP (optional) --------
+echo "==> [19/24] (Optional) feste IP setzen"
 read -r -p "Feste IP setzen? (y/N) " yn || true
 if [[ "${yn,,}" == "y" ]]; then
   read -r -p "Interface (eth0/wlan0) [wlan0]: " ifc; ifc=${ifc:-wlan0}
@@ -1113,14 +1405,22 @@ static domain_name_servers=$dns
 EOF
 fi
 
-# -------------------- Schritt 17: Kiosk-Hinweis --------------
-echo "==> [19/20] Kiosk: Scale=${KMB_SCALE}, DPI=${KMB_DPI}. Anpassbar durch erneutes Skript-Ausführen."
+# -------------------- Schritt 18: Hinweise -------------------
+echo "==> [20/24] Hinweis: ggf. ab-/anmelden (input-Gruppe) oder reboot."
 
-# -------------------- Schritt 18: Neustart -------------------
+# -------------------- Schritt 19: Kiosk-Hinweis --------------
+echo "==> [21/24] Kiosk: Scale=${KMB_SCALE}, DPI=${KMB_DPI}. Anpassbar durch erneutes Skript-Ausführen."
+
+# -------------------- Schritt 20: Neustart? ------------------
 read -r -p "Jetzt neu starten? (Y/n) " yn || true
 if [[ "${yn,,}" != "n" ]]; then
-  echo "==> [20/20] Reboot…"
+  echo "==> [22/24] Reboot…"
   sudo reboot
 else
-  echo "==> Fertig. Kiosk startet beim nächsten Login auf tty1 automatisch."
+  echo "==> Kiosk startet beim nächsten Login auf tty1 automatisch."
 fi
+
+echo "==> [23/24] Teste Web-API kurz…"
+curl -sS http://127.0.0.1:$PORT/api/state || true
+
+echo "==> [24/24] Installation abgeschlossen."
